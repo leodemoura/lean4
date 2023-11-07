@@ -15,12 +15,21 @@ inductive LitValue where
   -- TODO: add constructors for `Int`, `Float`, `UInt` ...
   deriving Inhabited, BEq, Hashable
 
+inductive LetValueKind
+  | erased -- the let value is erased
+  | lit -- the value is `.lit _`
+  | call -- the value is `(.const ..) ...`
+  | callFVar -- the value is `(.fvar ..) ...`
+  | proj -- the value is `.proj ..`
+  | quotLift -- the value is `Quot.lift ...`
+  deriving Inhabited, BEq
+
 structure LetDecl where
   fvarId : FVarId
   binderName : Name
   type : Expr
   value : Expr
-  erased : Bool
+  kind : LetValueKind
   deriving Inhabited, BEq
 
 structure Param where
@@ -45,23 +54,20 @@ structure CasesCore (Code : Type) where
   deriving Inhabited
 
 inductive Code where
-  -- | let (decl : LetDecl) (k : Code)
+  | let (decl : LetDecl) (k : Code)
   -- | fun (decl : FunDeclCore Code) (k : Code)
   -- | cases (cases : CasesCore Code)
   -- | return (fvarId : FVarId)
-  -- | unreach (type : Expr)
-  -- deriving Inhabited
+  | erased (e : Expr)
+  | unreach (type : Expr)
+  deriving Inhabited
 
-structure FunDeclCore (Code : Type) where
-  fvarId : FVarId
-  binderName : Name
+structure CodeLambda where
   params : Array Param
-  type : Expr
-  value : Code
+  body : Code
   deriving Inhabited
 
 abbrev Alt := AltCore Code
-abbrev FunDecl := FunDeclCore Code
 abbrev Cases := CasesCore Code
 
 inductive Arg where
@@ -71,6 +77,10 @@ inductive Arg where
   iff it denotes a `letDecl` -/
   | fvar (fvarId : FVarId)
   deriving Inhabited
+
+def Arg.toExpr (orig : Expr) : Arg → Expr
+  | .erased => orig
+  | .fvar fvarId => .fvar fvarId
 
 namespace Compile
 
@@ -111,12 +121,12 @@ namespace Compile
 inductive Element where
   | let (decl : LetDecl)
   | unreach (p : Param)
+  | quotLift (e : Expr)
   deriving Inhabited
 
 structure LCtx where
   params   : HashMap FVarId Param := {}
   letDecls : HashMap FVarId LetDecl := {}
-  funDecls : HashMap FVarId FunDecl := {}
   deriving Inhabited
 
 def LCtx.addParam (lctx : LCtx) (param : Param) : LCtx :=
@@ -125,11 +135,14 @@ def LCtx.addParam (lctx : LCtx) (param : Param) : LCtx :=
 def LCtx.addLetDecl (lctx : LCtx) (letDecl : LetDecl) : LCtx :=
   { lctx with letDecls := lctx.letDecls.insert letDecl.fvarId letDecl }
 
-def LCtx.addFunDecl (lctx : LCtx) (funDecl : FunDecl) : LCtx :=
-  { lctx with funDecls := lctx.funDecls.insert funDecl.fvarId funDecl }
-
 structure Context where
   baseName : Name
+
+inductive Terminator where
+  | unreach (e : Expr)
+  | erased (e : Expr)
+  | ret (e : FVarId)
+  deriving Inhabited
 
 structure State where
   lctx' : LocalContext := {}
@@ -141,24 +154,34 @@ structure State where
   typeCache : HashMap Expr Expr := {}
   /-- isTypeFormerType cache -/
   isTypeFormerTypeCache : HashMap Expr Bool := {}
+  parents : Array (Array Param × Array Element) := #[]
   /-- LCNF sequence, we chain it to create a LCNF `Code` object. -/
   seq : Array Element := #[]
+  terminator : Option Terminator := none
 
 abbrev M := ReaderT Context <| StateRefT State MetaM
 
-abbrev UnreachT := ExceptT Expr
+abbrev TermT := OptionT -- none means `terminator` was set
 
 instance : MonadLift MetaM M where
   monadLift x := do withLCtx (← get).lctx' (← getLocalInstances) x
 
 instance : MonadStateOf State M := inferInstance
 
-def toCode (ps : Array Param) (result : Except Expr Arg) : M Code := do
-  match result with
-  | .error unreach =>
-    sorry
-  | .ok _ =>
-    sorry
+def terminate (t : Terminator) : TermT M α :=
+  show M _ from do
+    modify fun s => { s with terminator := t }
+    pure none
+
+def toCode (ps : Array Param) (e : Expr) (result : Option Arg) : M Code := do
+  let terminator ← match result with
+    | none => pure (← get).terminator.get!
+    | some .erased => return .erased e
+    | some (.fvar e) => pure (.ret e)
+  sorry
+
+def toCodeLambda (ps : Array Param) (e : Expr) (result : Option Arg) : M CodeLambda :=
+  return { params := ps, body := (← toCode ps e result) }
 
 def inferLitValueType : LitValue → Expr
   | .natVal .. => mkConst ``Nat
@@ -193,9 +216,9 @@ def mkParam (binderName : Name) (type : Expr) : M Param := do
   }
   return param
 
-def mkLetDecl (binderName : Name) (type : Expr) (value : Expr) (erased : Bool) : M LetDecl := do
+def mkLetDecl (binderName : Name) (type : Expr) (value : Expr) (kind : LetValueKind) : M LetDecl := do
   let fvarId ← mkFreshFVarId
-  let letDecl := { fvarId, binderName, type, value, erased }
+  let letDecl := { fvarId, binderName, type, value, kind }
   modify fun s => { s with
     lctx := s.lctx.addLetDecl letDecl
     lctx' := s.lctx'.mkLetDecl letDecl.fvarId binderName type value false
@@ -207,15 +230,15 @@ def mkLetDecl (binderName : Name) (type : Expr) (value : Expr) (erased : Bool) :
 def pushElement (elem : Element) : M Unit := do
   modify fun s => { s with seq := s.seq.push elem }
 
-def mkAuxLetDecl (e : Expr) (erased : Bool) : M FVarId := do
+def mkAuxLetDecl (e : Expr) (kind : LetValueKind) : M FVarId := do
   match e with
   | .fvar fvarId => return fvarId
   | _ =>
-    let letDecl ← mkLetDecl (← mkFreshId) (← inferType e) e erased
+    let letDecl ← mkLetDecl (← mkFreshId) (← inferType e) e kind
     pushElement (.let letDecl)
     return letDecl.fvarId
 
-def letValueToArg (e : Expr) (erased := false) : UnreachT M Arg := .fvar <$> mkAuxLetDecl e erased
+def letValueToArg (kind : LetValueKind) (e : Expr) : TermT M Arg := .fvar <$> mkAuxLetDecl e kind
 
 /--
 Eta-expand with `n` lambdas.
@@ -267,32 +290,32 @@ where
     else
       return (ps, mkAppN e xs)
 
-partial def compile (baseName : Name) (e : Expr) : MetaM Code :=
+partial def compile (baseName : Name) (e : Expr) : MetaM CodeLambda :=
   (visitTop e { baseName }).run' {}
 where
-  visitTop (e : Expr) : M Code := do
+  visitTop (e : Expr) : M CodeLambda := do
     let (ps, e) ← lambdaTelescope e (etaExpand := true)
     let lctx := (← get).lctx'
     withTheReader Meta.Context (fun ctx => { ctx with lctx }) do
-      toCode ps (← visit e)
+      toCodeLambda ps e (← visit e)
 
-  visitCore (e : Expr) : UnreachT M Arg := do
+  visitCore (e : Expr) : TermT M Arg := do
     if let some arg := (← get).cache.find? e then
       return arg
     let r : Arg ← match e with
       | .app ..
-      | .const ..    => visitApp e
-      | .proj s i e  => visitProj s i e
-      | .lam ..      => visitLambda e
-      | .mdata _ e   => visitCore e
+      | .const ..
       | .letE ..     => visitLambdaApp #[] e []
+      | .lam ..      => visitLambda e
+      | .proj s i e  => visitProj s i e
+      | .mdata _ e   => visitCore e
       | .lit lit     => visitLit lit
       | .fvar fvarId => pure (.fvar fvarId)
       | .forallE .. | .mvar .. | .bvar .. | .sort ..  => unreachable!
     modify fun s => { s with cache := s.cache.insert e r }
     return r
 
-  visit (e : Expr) : UnreachT M Arg := do
+  visit (e : Expr) : TermT M Arg := do
     let type ← Meta.inferType e
     if ← Meta.isProp type then
       return .erased
@@ -300,30 +323,30 @@ where
       return .erased
     visitCore e
 
-  asFVar (e : Arg) (k : FVarId → UnreachT M Arg) : UnreachT M Arg := do
+  asFVar (e : Arg) (k : FVarId → TermT M Arg) : TermT M Arg := do
     match e with
     | .erased => return .erased
     | .fvar e => k e
 
-  visitAsExpr (e : Expr) : UnreachT M Expr := do
+  visitAsExpr (e : Expr) : TermT M Expr := do
     match (← visit e) with
     | .erased => return e
     | .fvar e => return .fvar e
 
-  visitLit (lit : Literal) : UnreachT M Arg :=
-    letValueToArg (.lit lit)
+  visitLit (lit : Literal) : TermT M Arg :=
+    letValueToArg .lit (.lit lit)
 
   /-- Giving `f` a constant `.const declName us`, convert `args` into `args'`, and return `.const declName us args'` -/
-  visitAppDefaultConst (f : Expr) (args : Array Expr) : UnreachT M Arg := do
+  visitAppDefaultConst (f : Expr) (args : Array Expr) : TermT M Arg := do
     let .const declName us := f | unreachable!
     let args ← args.mapM visitAsExpr
-    letValueToArg <| mkAppN (.const declName us) args
+    letValueToArg .call <| mkAppN (.const declName us) args
 
   /-- Eta expand if under applied, otherwise apply k -/
-  etaIfUnderApplied (e : Expr) (arity : Nat) (k : UnreachT M Arg) : UnreachT M Arg := do
+  etaIfUnderApplied (e : Expr) (args : Array Expr) (arity : Nat) (k : TermT M Arg) : TermT M Arg := do
     let numArgs := e.getAppNumArgs
     if numArgs < arity then
-      visit (← etaExpandN e (arity - numArgs))
+      visit (← etaExpandN (mkAppN e args) (arity - numArgs))
     else
       k
 
@@ -335,7 +358,7 @@ where
   k args[arity:]
   ```
   -/
-  mkOverApplication (app : Arg) (args : Array Expr) (arity : Nat) : UnreachT M Arg := do
+  mkOverApplication (app : Arg) (args : Array Expr) (arity : Nat) : TermT M Arg := do
     if args.size == arity then
       return app
     else
@@ -343,19 +366,15 @@ where
         let mut e : Expr := .fvar f
         for i in [arity : args.size] do
           e := .app e (← visitAsExpr args[i]!)
-        letValueToArg e
+        letValueToArg .callFVar e
 
   -- /--
   -- Visit a `matcher`/`casesOn` alternative.
   -- -/
   -- visitAlt (ctorName : Name) (numParams : Nat) (e : Expr) : M (Expr × Alt) := do
   --   withNewScope do
-  --     let mut (ps, e) ← lambdaTelescope e (bound := numParams)
-  --     if ps.size < numParams then
-  --       e ← etaExpandN e (numParams - ps.size)
-  --       let (ps', e') ← ToLCNF.visitLambda e
-  --       ps := ps ++ ps'
-  --       e := e'
+  --     let mut (ps, e) ← lambdaTelescope e (bound := numParams) (etaExpand := true)
+  --     if ps.size != numParams then throwError "bad type {e}"
   --     /-
   --     Insert the free variable ids of fields that are type formers into `toAny`.
   --     Recall that we do not want to have "data" occurring in types.
@@ -377,8 +396,8 @@ where
   --     let altType ← c.inferType
   --     return (altType, .alt ctorName ps c)
 
-  -- visitCases (casesInfo : CasesInfo) (e : Expr) : UnreachT M Arg :=
-  --   etaIfUnderApplied e casesInfo.arity do
+  -- visitCases (casesInfo : CasesInfo) (e : Expr) : TermT M Arg :=
+  --   etaIfUnderApplied f args casesInfo.arity do
   --     let args := e.getAppArgs
   --     let mut resultType ← toLCNFType (← liftMetaM do Meta.inferType (mkAppN e.getAppFn args[:casesInfo.arity]))
   --     if casesInfo.numAlts == 0 then
@@ -407,52 +426,69 @@ where
   --         let result := .fvar auxDecl.fvarId
   --         mkOverApplication result args casesInfo.arity
 
-  visitCtor (arity : Nat) (e : Expr) : UnreachT M Arg :=
-    etaIfUnderApplied e arity do
-      visitAppDefaultConst e.getAppFn e.getAppArgs
+  visitCtor (arity : Nat) (f : Expr) (args : Array Expr) : TermT M Arg :=
+    etaIfUnderApplied f args arity do
+      visitAppDefaultConst f args
 
-  -- visitQuotLift (e : Expr) : UnreachT M Arg := do
-  --   let arity := 6
-  --   etaIfUnderApplied e arity do
-  --     let mut args := e.getAppArgs
-  --     let α := args[0]!
-  --     let r := args[1]!
-  --     let f ← visit args[3]!
-  --     let q ← visit args[5]!
-  --     let .const _ [u, _] := e.getAppFn | unreachable!
-  --     let invq ← mkAuxLetDecl (.const ``Quot.lcInv [u] #[.type α, .type r, q])
-  --     match f with
-  --     | .erased => return .erased
-  --     | .fvar fvarId => mkOverApplication (← letValueToArg <| .fvar fvarId #[.fvar invq]) args arity
-
-  visitEqRec (e : Expr) : UnreachT M Arg :=
+  visitQuotLift (f : Expr) (args : Array Expr) : TermT M Arg := do
     let arity := 6
-    etaIfUnderApplied e arity do
+    etaIfUnderApplied f args arity do
+      let e := mkAppRange f 0 arity args
+      let letDecl ← mkLetDecl (← mkFreshId) (← inferType e) e .quotLift
+      pushElement (.let letDecl)
+      mkOverApplication (.fvar letDecl.fvarId) args arity
+      -- let α := args[0]!
+      -- let r := args[1]!
+      -- let f' ← visit args[3]!
+      -- let qOrig := args[5]!
+      -- let q ← visit qOrig
+      -- let .const _ [u, v] := f | unreachable!
+      -- let code ← liftM <| withNewScope do
+      --   let (ps, body) ← lambdaTelescope args[3]! (bound := some 1) (etaExpand := true)
+      --   assert! ps.size == 1
+      --   toCodeLambda ps body (← visit body)
+      -- if let .unreach e := code.body then
+      --   let f ← mkLambdaFVars (code.params.map (·.toExpr)) e
+      --   terminate <| .unreach <| mkApp4 (.const ``Quot.false_of_false [u]) α r (q.toExpr qOrig) f
+      -- let invq ← mkAuxLetDecl (.const ``Quot.lift [u] #[.type α, .type r, q])
+      -- match f' with
+      -- | .erased => return .erased
+      -- | .fvar fvarId => mkOverApplication (← letValueToArg <| .fvar fvarId #[.fvar invq]) args arity
+
+  visitEqRec (f : Expr) (args : Array Expr) : TermT M Arg :=
+    let arity := 6
+    etaIfUnderApplied f args arity do
       let args := e.getAppArgs
       let minor := if e.isAppOf ``Eq.rec || e.isAppOf ``Eq.ndrec then args[3]! else args[5]!
       let minor ← visit minor
       mkOverApplication minor args arity
 
-  visitFalseRec (e : Expr) : UnreachT M Arg :=
-    etaIfUnderApplied e (arity := 2) do
-      throwThe _ e.appArg!
+  visitFalseRec (f : Expr) (args : Array Expr) : TermT M Arg :=
+    etaIfUnderApplied f args (arity := 2) do
+      terminate <| .unreach e.appArg!
 
-  -- visitAndIffRecCore (e : Expr) (minorPos : Nat) : UnreachT M Arg :=
-  --   let arity := 5
-  --   etaIfUnderApplied e arity do
-  --     let args := e.getAppArgs
-  --     let ha := mkLcProof args[0]! -- We should not use `lcErased` here since we use it to create a pre-LCNF Expr.
-  --     let hb := mkLcProof args[1]!
-  --     let minor := args[minorPos]!
-  --     let minor := minor.beta #[ha, hb]
-  --     visit (mkAppN minor args[arity:])
+  visitEmptyRec (f : Expr) (args : Array Expr) : TermT M Arg :=
+    etaIfUnderApplied f args (arity := 2) do
+      let motive := .lam `t (.const ``Empty []) (.const ``False []) .default
+      terminate <| .unreach (mkApp2 (.const ``Empty.rec [.zero]) motive e.appArg!)
 
-  -- visitNoConfusion (e : Expr) : UnreachT M Arg := do
+  visitAndIffRecCore (f : Expr) (args : Array Expr) (left right : Name) (minorPos majorPos : Nat) : TermT M Arg :=
+    let arity := 5
+    etaIfUnderApplied f args arity do
+      let a := args[0]!
+      let b := args[1]!
+      let major := args[majorPos]!
+      let ha := mkApp3 (.const left []) a b major
+      let hb := mkApp3 (.const right []) a b major
+      let minor := args[minorPos]!.beta #[ha, hb]
+      visit (mkAppN minor args[arity:])
+
+  -- visitNoConfusion (f : Expr) (args : Array Expr) : TermT M Arg := do
   --   let .const declName _ := e.getAppFn | unreachable!
   --   let typeName := declName.getPrefix
   --   let .inductInfo inductVal ← getConstInfo typeName | unreachable!
   --   let arity := inductVal.numParams + inductVal.numIndices + 1 /- motive -/ + 2 /- lhs/rhs-/ + 1 /- equality -/
-  --   etaIfUnderApplied e arity do
+  --   etaIfUnderApplied f args arity do
   --     let args := e.getAppArgs
   --     let lhs ← liftMetaM do Meta.whnf args[inductVal.numParams + inductVal.numIndices + 1]!
   --     let rhs ← liftMetaM do Meta.whnf args[inductVal.numParams + inductVal.numIndices + 2]!
@@ -461,7 +497,7 @@ where
   --     match lhs.isConstructorApp? (← getEnv), rhs.isConstructorApp? (← getEnv) with
   --     | some lhsCtorVal, some rhsCtorVal =>
   --       if lhsCtorVal.name == rhsCtorVal.name then
-  --         etaIfUnderApplied e (arity+1) do
+  --         etaIfUnderApplied f args (arity+1) do
   --           let major := args[arity]!
   --           let major ← expandNoConfusionMajor major lhsCtorVal.numFields
   --           let major := mkAppN major args[arity+1:]
@@ -482,10 +518,10 @@ where
   --     else
   --       expandNoConfusionMajor (← etaExpandN major (n+1)) (n+1)
 
-  visitProjFn (projInfo : ProjectionFunctionInfo) (e : Expr) : UnreachT M Arg := do
+  visitProjFn (projInfo : ProjectionFunctionInfo) (f : Expr) (args : Array Expr) : TermT M Arg := do
     let typeName := projInfo.ctorName.getPrefix
     if isBultinType typeName then
-      etaIfUnderApplied e (arity := projInfo.numParams + 1) do
+      etaIfUnderApplied f args (arity := projInfo.numParams + 1) do
         visitAppDefaultConst e.getAppFn e.getAppArgs
     else
       let .const declName us := e.getAppFn | unreachable!
@@ -493,34 +529,38 @@ where
       let f ← Core.instantiateValueLevelParams info us
       visit (f.beta e.getAppArgs)
 
-  visitApp (e : Expr) : UnreachT M Arg := do
-    if let .const declName _ := e.getAppFn then
-      -- if declName == ``Quot.lift then
-      --   visitQuotLift e
-      -- else if declName == ``Quot.mk then
-      --   visitCtor 3 e
-      -- else if declName == ``Eq.casesOn || declName == ``Eq.rec || declName == ``Eq.ndrec then
-      --   visitEqRec e
-      -- else if declName == ``And.rec || declName == ``Iff.rec then
-      --   visitAndIffRecCore e (minorPos := 3)
-      -- else if declName == ``And.casesOn || declName == ``Iff.casesOn then
-      --   visitAndIffRecCore e (minorPos := 4)
-      -- else if declName == ``False.rec || declName == ``Empty.rec || declName == ``False.casesOn || declName == ``Empty.casesOn then
-      --   visitFalseRec e
-      -- else if let some casesInfo ← Compiler.LCNF.getCasesInfo? declName then
-      --   visitCases casesInfo e
-      -- else if let some arity ← Compiler.LCNF.getCtorArity? declName then
-      --   visitCtor arity e
-      -- else if isNoConfusion (← getEnv) declName then
-      --   visitNoConfusion e
-      -- else if let some projInfo ← getProjectionFnInfo? declName then
-      --   visitProjFn projInfo e
-      -- else
-        e.withApp visitAppDefaultConst
+  visitConstApp (f : Expr) (args : Array Expr) : TermT M Arg := do
+    let declName := f.constName!
+    if declName == ``Quot.lift then
+      visitQuotLift f args
+    else if declName == ``Quot.mk then
+      visitCtor 3 f args
+    -- else if declName == ``Eq.casesOn || declName == ``Eq.rec || declName == ``Eq.ndrec then
+    --   visitEqRec f args
+    else if declName == ``And.rec || declName == ``Iff.rec then
+      visitAndIffRecCore f args ``And.left ``And.right (minorPos := 3) (majorPos := 4)
+    else if declName == ``And.casesOn || declName == ``Iff.casesOn then
+      visitAndIffRecCore f args ``And.left ``And.right (minorPos := 4) (majorPos := 3)
+    else if declName == ``Iff.rec then
+      visitAndIffRecCore f args ``Iff.mp ``Iff.mpr (minorPos := 3) (majorPos := 4)
+    else if declName == ``Iff.casesOn then
+      visitAndIffRecCore f args ``Iff.mp ``Iff.mpr (minorPos := 4) (majorPos := 3)
+    else if declName == ``False.rec || declName == ``False.casesOn then
+      visitFalseRec f args
+    else if declName == ``Empty.rec || declName == ``Empty.casesOn then
+      visitEmptyRec f args
+    -- else if let some casesInfo ← Compiler.LCNF.getCasesInfo? declName then
+    --   visitCases casesInfo f args
+    else if let some arity ← Compiler.LCNF.getCtorArity? declName then
+      visitCtor arity f args
+    -- else if isNoConfusion (← getEnv) declName then
+    --   visitNoConfusion f args
+    else if let some projInfo ← getProjectionFnInfo? declName then
+      visitProjFn projInfo f args
     else
-      visitLambdaApp #[] e []
+      visitAppDefaultConst f args
 
-  visitLambdaApp (xs : Array Expr) : Expr → List Expr → UnreachT M Arg
+  visitLambdaApp (xs : Array Expr) : Expr → List Expr → TermT M Arg
     | .app f a, args => visitLambdaApp xs f (a :: args)
     | .lam _ _ body .., value :: args
     | .letE _ _ value body _, args => do
@@ -529,11 +569,17 @@ where
     | .mdata _ e, args => visitLambdaApp xs e args
     | e, [] => visit (e.instantiateRev xs)
     | e, args => do
-      asFVar (← visit (e.instantiateRev xs)) fun fvarId => do
-        let args ← args.toArray.mapM fun a => visitAsExpr <| a.instantiateRev xs
-        letValueToArg <| mkAppN (.fvar fvarId) args
+      let e := e.instantiateRev xs
+      if let .const declName _ := e then
+        visitConstApp e (args.toArray.map (·.instantiateRev xs))
+      else if let [] := args then
+        visit e
+      else
+        asFVar (← visit e) fun fvarId => do
+          let args ← args.toArray.mapM fun a => visitAsExpr <| a.instantiateRev xs
+          letValueToArg .callFVar <| mkAppN (.fvar fvarId) args
 
-  visitLambda (e : Expr) : UnreachT M Arg := do
+  visitLambda (e : Expr) : TermT M Arg := do
     let b := etaReduceImplicit e
     if !b.isLambda && !mustEtaExpand (← getEnv) b then
       visit b
@@ -543,9 +589,9 @@ where
       let e' ← mkAuxDefinition defName (← inferType e).headBeta e (compile := false)
       visit e'
 
-  visitProj (s : Name) (i : Nat) (e : Expr) : UnreachT M Arg := do
+  visitProj (s : Name) (i : Nat) (e : Expr) : TermT M Arg := do
     asFVar (← visit e) fun fvarId =>
-      letValueToArg <| .proj s i (.fvar fvarId)
+      letValueToArg .proj <| .proj s i (.fvar fvarId)
 
 end Compile
 

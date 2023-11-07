@@ -1239,6 +1239,9 @@ protected theorem inductionOn {α : Sort u} {r : α → α → Prop} {motive : Q
 theorem exists_rep {α : Sort u} {r : α → α → Prop} (q : Quot r) : Exists (fun a => (Quot.mk r a) = q) :=
   q.inductionOn (fun a => ⟨a, rfl⟩)
 
+protected theorem false_of_false {α : Sort u} {r : α → α → Prop} (q : Quot r) (f : α → False) : False :=
+  q.inductionOn f
+
 section
 variable {α : Sort u}
 variable {r : α → α → Prop}
